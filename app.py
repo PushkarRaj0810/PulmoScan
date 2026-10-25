@@ -1,17 +1,19 @@
-﻿
-from pathlib import Path
+﻿from pathlib import Path
 import hashlib
 from io import BytesIO
 
 import streamlit as st
 import tensorflow as tf
+import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 import gradcam
 
 # ---------------- Configuration ----------------
 LOGO_PATH = Path("pulmoscan_logo.jpg")
+VERIFIER_PATH = Path("models/xray_verifier_best.keras")
 MAX_FILE_SIZE = 10 * 1024 * 1024
+NOT_XRAY_THRESHOLD = 0.5
 
 st.set_page_config(
     page_title="PulmoScan | Chest X-ray",
@@ -35,14 +37,19 @@ st.markdown(
 
     .stApp {
         background:
-            radial-gradient(ellipse at 85% 0%,
-                rgba(34,184,199,.16), transparent 34rem),
+            radial-gradient(
+                ellipse at 85% 0%,
+                rgba(34,184,199,.16),
+                transparent 34rem
+            ),
             var(--canvas);
         color: var(--ink);
         font-family: 'Segoe UI', Arial, sans-serif;
     }
 
-    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stHeader"] {
+        background: transparent;
+    }
 
     [data-testid="stMainBlockContainer"] {
         max-width: 1450px;
@@ -77,11 +84,11 @@ st.markdown(
         font-size: .82rem;
     }
 
-    .eyebrow {
+    .eyebrow, .section-kicker {
         color: var(--teal);
         font-size: .75rem;
         font-weight: 800;
-        letter-spacing: .14em;
+        letter-spacing: .12em;
         margin-top: .5rem;
         text-transform: uppercase;
     }
@@ -138,14 +145,6 @@ st.markdown(
         border-color: #096b76;
     }
 
-    .section-kicker {
-        color: var(--teal);
-        font-size: .72rem;
-        font-weight: 800;
-        letter-spacing: .1em;
-        text-transform: uppercase;
-    }
-
     .empty-state {
         background: #153641;
         border: 1px dashed #426773;
@@ -199,8 +198,13 @@ st.markdown(
         margin-top: .1rem;
     }
 
-    .result-class.normal { color: #58d6a1; }
-    .result-class.pneumonia { color: #ff9b91; }
+    .result-class.normal {
+        color: #58d6a1;
+    }
+
+    .result-class.pneumonia {
+        color: #ff9b91;
+    }
 
     .score-card-value {
         color: var(--ink);
@@ -229,7 +233,9 @@ st.markdown(
         padding: .65rem .8rem;
     }
 
-    .result-notice strong { color: #fff0c9; }
+    .result-notice strong {
+        color: #fff0c9;
+    }
 
     .footer-copy {
         color: #8faab5;
@@ -261,24 +267,63 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+# ---------------- Model Loading ----------------
 @st.cache_resource
 def load_model():
-    """Load the classifier once per Streamlit server process."""
+    """Load the pneumonia classifier."""
     if not gradcam.MODEL_PATH.is_file():
         raise FileNotFoundError(
-            f"Model not found: {gradcam.MODEL_PATH.resolve()}"
+            f"Classifier model not found: {gradcam.MODEL_PATH.resolve()}"
         )
+
     return tf.keras.models.load_model(gradcam.MODEL_PATH)
 
 
 @st.cache_resource
 def load_gradcam_models():
-    """Cache the graph pieces used for gradients alongside the classifier."""
+    """Cache the models needed for Grad-CAM."""
     return gradcam.build_gradcam_models(load_model())
 
 
+@st.cache_resource
+def load_verifier():
+    """Load the chest X-ray versus non-X-ray verifier."""
+    if not VERIFIER_PATH.is_file():
+        raise FileNotFoundError(
+            f"X-ray verifier not found: {VERIFIER_PATH.resolve()}"
+        )
+
+    return tf.keras.models.load_model(VERIFIER_PATH)
+
+
+def verify_chest_xray(image):
+    """
+    Return (accepted, non_xray_score).
+
+    Verifier output:
+        Class 0 = CHEST_XRAY
+        Class 1 = NOT_CHEST_XRAY
+    """
+    verifier = load_verifier()
+
+    resized = image.convert("RGB").resize((160, 160))
+    pixels = np.asarray(resized, dtype=np.float32)
+    batch = np.expand_dims(pixels, axis=0)
+
+    score = float(
+        verifier.predict(batch, verbose=0)[0][0]
+    )
+
+    accepted = score < NOT_XRAY_THRESHOLD
+
+    return accepted, score
+
 # ---------------- Header ----------------
-logo_col, brand_col = st.columns([1, 5], vertical_alignment="center")
+logo_col, brand_col = st.columns(
+    [1, 5],
+    vertical_alignment="center",
+)
 
 with logo_col:
     if LOGO_PATH.is_file():
@@ -289,14 +334,18 @@ with logo_col:
 with brand_col:
     st.markdown(
         '<div class="brand-name">PulmoScan</div>'
-        '<div class="brand-caption">Chest X-ray research demo</div>',
+        '<div class="brand-caption">'
+        'Chest X-ray research demo'
+        '</div>',
         unsafe_allow_html=True,
     )
 
 st.markdown(
     """
     <div class="eyebrow">Chest X-ray image exploration</div>
-    <h1 class="hero-title">A clearer view of your chest X-ray.</h1>
+    <h1 class="hero-title">
+        A clearer view of your chest X-ray.
+    </h1>
     <p class="hero-copy">
         Upload a chest X-ray to explore the output of our experimental
         ResNet50 model. This project is intended for education and research.
@@ -305,8 +354,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # ---------------- Main Interface ----------------
-upload_col, preview_col = st.columns([1.35, 1], gap="medium")
+upload_col, preview_col = st.columns(
+    [1.35, 1],
+    gap="medium",
+)
 
 with upload_col:
     with st.container(border=True):
@@ -314,7 +367,9 @@ with upload_col:
             '<div class="section-kicker">Step 1 · Add an image</div>',
             unsafe_allow_html=True,
         )
+
         st.subheader("Upload a chest X-ray")
+
         uploaded_file = st.file_uploader(
             "Choose a JPG or PNG image",
             type=["jpg", "jpeg", "png"],
@@ -332,19 +387,68 @@ with upload_col:
 
             if len(file_bytes) > MAX_FILE_SIZE:
                 st.error("Please upload an image smaller than 10 MB.")
+
             else:
                 try:
+                    # Verify that the uploaded file is a valid image.
                     with Image.open(BytesIO(file_bytes)) as source:
                         source.verify()
 
                     with Image.open(BytesIO(file_bytes)) as source:
                         image = source.convert("RGB")
 
-                    analysis_image, image_array = gradcam.prepare_xray(image)
-                except (UnidentifiedImageError, OSError, ValueError) as error:
-                    st.error(f"This file is not a valid image: {error}")
+                    # Reject non-X-rays before pneumonia classification.
+                    try:
+                        is_xray, non_xray_score = verify_chest_xray(image)
+                        
+                    except Exception as error:
+                        st.error(
+                            "PulmoScan could not verify this image. "
+                            "Classification has been stopped. "
+                            f"Verifier error: {error}"
+                        )
+
+                        image = None
+                        analysis_image = None
+                        image_array = None
+
+                    else:
+                        if not is_xray:
+                            st.error(
+                                "This image was rejected because the "
+                                "verifier classified it as not a chest X-ray. "
+                                "Please upload a chest X-ray."
+                            )
+
+                            st.caption(
+                                f"Verifier non-X-ray score: "
+                                f"{non_xray_score:.1%}. "
+                                "This experimental verifier can make mistakes."
+                            )
+
+                            image = None
+                            analysis_image = None
+                            image_array = None
+
+                        else:
+                            # Only verified images reach the classifier.
+                            analysis_image, image_array = (
+                                gradcam.prepare_xray(image)
+                            )
+
+                except (
+                    UnidentifiedImageError,
+                    OSError,
+                    ValueError,
+                ) as error:
+                    st.error(
+                        f"This file is not a valid image: {error}"
+                    )
+
                     image = None
+                    analysis_image = None
                     image_array = None
+
 
 with preview_col:
     with st.container(border=True):
@@ -352,13 +456,19 @@ with preview_col:
             '<div class="section-kicker">Image preview</div>',
             unsafe_allow_html=True,
         )
+
         if image is not None:
             st.markdown(
-                f'<div class="empty-title">{uploaded_file.name}</div>',
+                f'<div class="empty-title">'
+                f'{uploaded_file.name}</div>',
                 unsafe_allow_html=True,
             )
+
             st.image(image, width="stretch")
-            st.caption(f"{image.width} × {image.height} px")
+            st.caption(
+                f"{image.width} × {image.height} px"
+            )
+
         else:
             st.markdown(
                 """
@@ -371,12 +481,15 @@ with preview_col:
                 unsafe_allow_html=True,
             )
 
+
 st.markdown(
     '<div class="section-kicker">Step 2 · Review output</div>',
     unsafe_allow_html=True,
 )
+
 st.subheader("Model analysis")
 
+# ---------------- Model Analysis ----------------
 if image is None or image_array is None:
     st.markdown(
         """
@@ -387,21 +500,23 @@ if image is None or image_array is None:
         """,
         unsafe_allow_html=True,
     )
+
 else:
     result = st.session_state.get("pulmoscan_result")
+
+    # Reuse the result if the uploaded image has not changed.
     if not result or result["file_id"] != file_id:
-        with st.spinner("Running model analysis and generating Grad-CAM..."):
+
+        with st.spinner(
+            "Running model analysis and generating Grad-CAM..."
+        ):
             try:
                 model = load_model()
-            except (
-                ImportError,
-                OSError,
-                RuntimeError,
-                TypeError,
-                ValueError,
-                tf.errors.OpError,
-            ) as error:
-                st.error(f"PulmoScan could not load its model: {error}")
+
+            except Exception as error:
+                st.error(
+                    f"PulmoScan could not load its model: {error}"
+                )
                 model = None
 
             if model is not None:
@@ -411,43 +526,38 @@ else:
                 gradcam_error = None
                 score = None
 
+                # Generate Grad-CAM and obtain the prediction.
                 try:
                     heatmap, score = gradcam.generate_gradcam(
                         model,
                         image_array,
                         gradcam_models=load_gradcam_models(),
                     )
-                except (
-                    AttributeError,
-                    IndexError,
-                    KeyError,
-                    RuntimeError,
-                    TypeError,
-                    ValueError,
-                    tf.errors.OpError,
-                ) as error:
+
+                except Exception as error:
                     gradcam_error = str(error)
+
                     if isinstance(error, gradcam.GradCAMError):
                         score = error.score
 
+                # If Grad-CAM fails, still attempt a normal prediction.
                 if score is None:
                     try:
                         score = float(
-                            model.predict(image_array, verbose=0)[0][0]
+                            model.predict(
+                                image_array,
+                                verbose=0,
+                            )[0][0]
                         )
-                    except (
-                        IndexError,
-                        RuntimeError,
-                        TypeError,
-                        ValueError,
-                        tf.errors.OpError,
-                    ) as error:
+
+                    except Exception as error:
                         st.error(
                             "PulmoScan could not analyze this image: "
                             f"{error}"
                         )
                         score = None
 
+                # Create the heatmap and overlay.
                 if score is not None and heatmap is not None:
                     try:
                         heatmap_image, overlay_image = (
@@ -456,17 +566,15 @@ else:
                                 heatmap,
                             )
                         )
-                    except (
-                        OSError,
-                        RuntimeError,
-                        TypeError,
-                        ValueError,
-                    ) as error:
+
+                    except Exception as error:
                         gradcam_error = (
                             "The prediction is available, but the "
-                            f"visualization could not be prepared: {error}"
+                            "visualization could not be prepared: "
+                            f"{error}"
                         )
 
+                # Store results for this image.
                 if score is not None:
                     st.session_state["pulmoscan_result"] = {
                         "file_id": file_id,
@@ -475,34 +583,53 @@ else:
                         "overlay_image": overlay_image,
                         "gradcam_error": gradcam_error,
                     }
+
                     result = st.session_state["pulmoscan_result"]
 
+    # ---------------- Display Results ----------------
     if result and result["file_id"] == file_id:
         score = result["score"]
+
         prediction = gradcam.CLASS_NAMES[int(score >= 0.5)]
-        style = "pneumonia" if prediction == "PNEUMONIA" else "normal"
+
+        style = (
+            "pneumonia"
+            if prediction == "PNEUMONIA"
+            else "normal"
+        )
+
         st.markdown(
             f"""
             <div class="result-summary">
                 <div>
-                    <span class="result-summary-label">Model prediction</span>
-                    <div class="result-class {style}">{prediction}</div>
+                    <span class="result-summary-label">
+                        Model prediction
+                    </span>
+                    <div class="result-class {style}">
+                        {prediction}
+                    </div>
                 </div>
                 <div>
                     <span class="result-summary-score-label">
                         PNEUMONIA model score
                     </span>
-                    <strong class="score-card-value">{score:.1%}</strong>
+                    <strong class="score-card-value">
+                        {score:.1%}
+                    </strong>
                 </div>
             </div>
+
             <p class="score-caption">
-                The score is the model's sigmoid output and is not necessarily
-                a calibrated probability of disease.
+                The score is the model's sigmoid output and is not
+                necessarily a calibrated probability of disease.
             </p>
+
             <div class="result-notice">
-                <strong>⚠ Experimental AI — not a medical diagnosis.</strong>
-                This output is not clinically validated and must not replace
-                advice from a qualified healthcare professional.
+                <strong>
+                    ⚠ Experimental AI — not a medical diagnosis.
+                </strong>
+                This output is not clinically validated and must not
+                replace advice from a qualified healthcare professional.
             </div>
             """,
             unsafe_allow_html=True,
@@ -514,12 +641,22 @@ else:
                 f"be displayed: {result['gradcam_error']}"
             )
 
-        original_col, heatmap_col, overlay_col = st.columns(3, gap="medium")
+        original_col, heatmap_col, overlay_col = st.columns(
+            3,
+            gap="medium",
+        )
+
         with original_col:
             st.markdown("**Original X-ray**")
-            st.image(image, caption=uploaded_file.name, width="stretch")
+            st.image(
+                image,
+                caption=uploaded_file.name,
+                width="stretch",
+            )
+
         with heatmap_col:
             st.markdown(f"**Grad-CAM · {prediction}**")
+
             if result["heatmap_image"] is not None:
                 st.image(
                     result["heatmap_image"],
@@ -528,8 +665,10 @@ else:
                 )
             else:
                 st.info("The Grad-CAM heatmap is unavailable.")
+
         with overlay_col:
             st.markdown("**Overlay**")
+
             if result["overlay_image"] is not None:
                 st.image(
                     result["overlay_image"],
@@ -539,6 +678,8 @@ else:
             else:
                 st.info("The Grad-CAM overlay is unavailable.")
 
+
+# ---------------- Footer ----------------
 st.markdown(
     """
     <div class="footer-copy">
